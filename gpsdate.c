@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>	
@@ -38,7 +39,7 @@
    so larger offsets are stepped with settimeofday() instead: */
 #define MAX_SLEW_USEC		1000000LL
 
-#define TIME_FMT		"%04d-%02d-%02d %02d:%02d:%02d"
+#define TIME_FMT		"%04d-%02d-%02d %02d:%02d:%02d.%03ld"
 
 static volatile bool read_gps = true;
 static bool date_changed;
@@ -85,6 +86,28 @@ int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval 
   return (x->tv_sec < y->tv_sec);
 }
 
+/* Converts an optional ".ddd..." suffix to microseconds (digits beyond 6 are
+   ignored). Returns 0 when there is no fraction, -1 when it is malformed. */
+static long parse_fraction_usec(const char *s)
+{
+	long usec = 0;
+	long scale = 100000;
+
+	if (*s == '\0')
+		return 0;
+	if (*s++ != '.')
+		return -1;
+
+	for (; *s; s++) {
+		if (!isdigit((unsigned char)*s))
+			return -1;
+		usec += (*s - '0') * scale;
+		scale /= 10;
+	}
+
+	return usec;
+}
+
 static void print_help(bool full_help, const char *program_name)
 {
 	if (full_help) {
@@ -117,11 +140,18 @@ static void process_message(const char *msgid, const char **data)
 		if (strcmp(data[1], "A") != 0)
 			return;
 
-		/* Parse UTC time: */
+		/* Parse UTC time (hhmmss[.sss]): */
 		int day, month, year, hours, minutes, seconds;
+		int consumed = 0;
+		long usec;
 		const char *tfmt = "%02d%02d%02d";
 
-		if (sscanf(data[0], tfmt, &hours, &minutes, &seconds) != 3)
+		if (sscanf(data[0], "%02d%02d%02d%n", &hours, &minutes, &seconds,
+			   &consumed) != 3 || consumed != 6)
+			return;
+
+		usec = parse_fraction_usec(data[0] + consumed);
+		if (usec < 0)
 			return;
 
 		if (sscanf(data[8], tfmt, &day, &month, &year) != 3)
@@ -144,9 +174,11 @@ static void process_message(const char *msgid, const char **data)
 
 			printf("Local time was: " TIME_FMT " (%s)\n",
 			       (t->tm_year + 1900), (t->tm_mon + 1), t->tm_mday,
-			       t->tm_hour, t->tm_min, t->tm_sec, t->tm_zone);
+			       t->tm_hour, t->tm_min, t->tm_sec,
+			       (long)sys_timev.tv_usec / 1000, t->tm_zone);
 			printf("GPS   time  is: " TIME_FMT " (%s)\n",
-			       year, month, day, hours, minutes, seconds, t->tm_zone);
+			       year, month, day, hours, minutes, seconds,
+			       usec / 1000, t->tm_zone);
 
 
 			t->tm_year = year - 1900;
@@ -160,14 +192,15 @@ static void process_message(const char *msgid, const char **data)
 			gps_timev.tv_sec = timegm(t);
 
 			gps_timev.tv_sec+=rollover_correction;
-			gps_timev.tv_usec=(long int)  0;
+			gps_timev.tv_usec = usec;
 
 			if ( opt_correct_rollover == true )  {
 
 				struct tm *new_t = gmtime(&gps_timev.tv_sec);
 				printf("1024 weeks Corrected time is: " TIME_FMT " (%s)\n",
                         	       (new_t->tm_year + 1900), (new_t->tm_mon + 1), new_t->tm_mday,
-	                               new_t->tm_hour, new_t->tm_min, new_t->tm_sec, new_t->tm_zone);
+	                               new_t->tm_hour, new_t->tm_min, new_t->tm_sec,
+				       usec / 1000, new_t->tm_zone);
 			}
 			if ( opt_dry_run == false ) {
 				timeval_subtract(&delta_timev,&gps_timev,&sys_timev);
