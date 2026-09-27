@@ -34,6 +34,9 @@
 #define DEFAULT_TIMEOUT		10
 /* the correcti is 1024 weeks : 1024*7*24*3600 */
 #define ROLLOVER_CORRECTION	619315200
+/* adjtime() slews the clock at only ~0.5 ms per second (1 s takes ~33 min),
+   so larger offsets are stepped with settimeofday() instead: */
+#define MAX_SLEW_USEC		1000000LL
 
 #define TIME_FMT		"%04d-%02d-%02d %02d:%02d:%02d"
 
@@ -82,21 +85,6 @@ int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval 
   return (x->tv_sec < y->tv_sec);
 }
 
-long int timeval_diffabs( struct timeval *x, struct timeval *y)
-{
-	struct timeval result;
-	result.tv_usec=0;
-
-	if ( x->tv_sec < y->tv_sec ) {
-		result.tv_sec= y->tv_sec  - x->tv_sec ;
-	}	
-	else {
-		result.tv_sec = x->tv_sec - y->tv_sec ;
-	}
-	return result.tv_sec;
-
-}
-
 static void print_help(bool full_help, const char *program_name)
 {
 	if (full_help) {
@@ -121,7 +109,9 @@ static void process_message(const char *msgid, const char **data)
 	while (data[length])
 		length++;
 
-	if (strcmp(msgid, "GPRMC") == 0 && (length == 11 || length == 12)) {
+	/* Accept RMC from any talker (GPRMC, GNRMC, GLRMC, ...): */
+	if (strlen(msgid) == 5 && strcmp(msgid + 2, "RMC") == 0 &&
+	    (length == 11 || length == 12)) {
 
 		/* Only parse time when there is a fix: */
 		if (strcmp(data[1], "A") != 0)
@@ -181,8 +171,11 @@ static void process_message(const char *msgid, const char **data)
 			}
 			if ( opt_dry_run == false ) {
 				timeval_subtract(&delta_timev,&gps_timev,&sys_timev);
-				if ( timeval_diffabs(&sys_timev,&gps_timev)  < 60 ) {
-					printf("Adjtime : ");
+				long long delta_usec = (long long)delta_timev.tv_sec * 1000000LL +
+						       delta_timev.tv_usec;
+				if (llabs(delta_usec) < MAX_SLEW_USEC) {
+					printf("Adjtime (slewing by %+.3f s) : ",
+					       (double)delta_usec / 1e6);
 					if (adjtime(&delta_timev,NULL) == 0 )  {
                                                 printf("Successfully updated local time.\n");
                                                 date_changed = true;
