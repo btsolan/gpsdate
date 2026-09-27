@@ -195,8 +195,8 @@ static void process_message(const char *msgid, const char **data)
 				}
 				else
 				{
-					printf("settime : ");	
-					if (stime(&gps_timev.tv_sec) == 0) {
+					printf("settime : ");
+					if (settimeofday(&gps_timev, NULL) == 0) {
 						printf("Successfully updated local time.\n");
 						date_changed = true;
 					} else {
