@@ -25,7 +25,9 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/time.h>	
+#include <errno.h>
+#include <poll.h>
+#include <sys/time.h>
 #include <math.h>
 
 #include "nmea.h"
@@ -33,6 +35,7 @@
 
 #define DEFAULT_BAUDRATE	9600
 #define DEFAULT_TIMEOUT		10
+#define POLL_INTERVAL_MS	1000
 /* the correcti is 1024 weeks : 1024*7*24*3600 */
 #define ROLLOVER_CORRECTION	619315200
 /* adjtime() slews the clock at only ~0.5 ms per second (1 s takes ~33 min),
@@ -51,7 +54,7 @@ static const char *help_text =
 "Sets time from a GPS receiver connected to a serial port as a local time.\n\n"
 "Options:\n"
 "  -b <baudrate>    Sets baud rate. Only a limited set of baud rates {2400,\n"
-"                   4800, ..., 230400} is supported (Default %d baud).\n"
+"                   4800, ..., 921600} is supported (Default %d baud).\n"
 "  -t,-d <timeout>  Sets the maximum timeout in seconds or 0 for no timeout\n"
 "                   (Default %d seconds)\n"
 "  -h               Displays this help.\n"
@@ -132,9 +135,10 @@ static void process_message(const char *msgid, const char **data)
 	while (data[length])
 		length++;
 
-	/* Accept RMC from any talker (GPRMC, GNRMC, GLRMC, ...): */
+	/* Accept RMC from any talker (GPRMC, GNRMC, GLRMC, ...). Field count
+	   is 11 before NMEA 2.3, 12 with mode (2.3), 13 with nav status (4.1): */
 	if (strlen(msgid) == 5 && strcmp(msgid + 2, "RMC") == 0 &&
-	    (length == 11 || length == 12)) {
+	    length >= 11 && length <= 13) {
 
 		/* Only parse time when there is a fix: */
 		if (strcmp(data[1], "A") != 0)
@@ -299,7 +303,10 @@ int main(int argc, char **argv)
 	time_t start_time, curr_time;
 	time(&start_time);
 
-	char buffer[64];
+	/* Read everything available as soon as it arrives, so no backlog
+	   builds up at high update rates and the parsed time is fresh: */
+	char buffer[4096];
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
 	while (read_gps) {
 		time(&curr_time);
@@ -309,11 +316,22 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		ssize_t nread = read(fd, buffer, sizeof(buffer));
-		if (nread > 0)
-			nmea_parse(buffer, (size_t)nread, &process_message);
+		/* Wake up at least once a second to check the timeout: */
+		int ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+		if (ready < 0 && errno != EINTR) {
+			perror("poll");
+			break;
+		}
+		if (ready <= 0)
+			continue;
 
-		usleep(100000);
+		ssize_t nread = read(fd, buffer, sizeof(buffer));
+		if (nread > 0) {
+			nmea_parse(buffer, (size_t)nread, &process_message);
+		} else if (nread == 0 || (errno != EAGAIN && errno != EINTR)) {
+			fprintf(stderr, "Lost connection to %s\n", port_name);
+			break;
+		}
 	}
 
 	close(fd);
