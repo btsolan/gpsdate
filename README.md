@@ -63,6 +63,11 @@ Options:
   -h               Displays this help.
   -r               Correct GPS week number rollover
   -n               Dry run , Get the GPS time but don't apply it
+  -s               Always step the clock with settimeofday(), never slew
+                   (also cancels any adjtime() slew already in progress)
+
+The last line printed is machine-readable:
+  offset_us=<+/-usec GPS minus system time, or unknown> method=step|slew|none
 
 ```
 

@@ -49,6 +49,15 @@ static bool date_changed;
 
 static bool opt_correct_rollover = false;
 static bool opt_dry_run = false;
+static bool opt_force_step = false;
+
+/* System time when the '$' of the sentence being parsed arrived: */
+static struct timeval sentence_timev;
+
+/* Reported in the final machine-readable line: */
+static bool offset_measured;
+static long long offset_usec;
+static const char *set_method = "none";
 
 static const char *help_text =
 "Sets time from a GPS receiver connected to a serial port as a local time.\n\n"
@@ -59,7 +68,11 @@ static const char *help_text =
 "                   (Default %d seconds)\n"
 "  -h               Displays this help.\n"
 "  -r               Correct GPS week number rollover\n"
-"  -n               Dry run , Get the GPS time but don\'t apply it\n";
+"  -n               Dry run , Get the GPS time but don\'t apply it\n"
+"  -s               Always step the clock with settimeofday(), never slew\n"
+"                   (also cancels any adjtime() slew already in progress)\n\n"
+"The last line printed is machine-readable:\n"
+"  offset_us=<+/-usec GPS minus system time, or unknown> method=step|slew|none\n";
 
 
 /* Subtract the ‘struct timeval’ values X and Y,
@@ -170,9 +183,9 @@ static void process_message(const char *msgid, const char **data)
 		    (minutes >= 0 && minutes <= 59) &&
 		    (seconds >= 0 && seconds <= 59)) {
 
-			/* Get current time, print it and modify: */
-			
-			gettimeofday(&sys_timev, 0);
+			/* Compare against the system time when this sentence's
+			   '$' arrived, not now (after reading and parsing): */
+			sys_timev = sentence_timev;
 
 			struct tm *t = gmtime(&sys_timev.tv_sec);
 
@@ -206,38 +219,47 @@ static void process_message(const char *msgid, const char **data)
 	                               new_t->tm_hour, new_t->tm_min, new_t->tm_sec,
 				       usec / 1000, new_t->tm_zone);
 			}
-			if ( opt_dry_run == false ) {
-				timeval_subtract(&delta_timev,&gps_timev,&sys_timev);
-				long long delta_usec = (long long)delta_timev.tv_sec * 1000000LL +
-						       delta_timev.tv_usec;
-				if (llabs(delta_usec) < MAX_SLEW_USEC) {
-					printf("Adjtime (slewing by %+.3f s) : ",
-					       (double)delta_usec / 1e6);
-					if (adjtime(&delta_timev,NULL) == 0 )  {
-                                                printf("Successfully updated local time.\n");
-                                                date_changed = true;
-                                        } else {
-                                                fprintf(stderr, "Couldn't set local time. "
-                                                        "Do you have root privileges?\n");
-                                        }
+			long long delta_usec =
+				(long long)(gps_timev.tv_sec - sys_timev.tv_sec) * 1000000LL +
+				(gps_timev.tv_usec - sys_timev.tv_usec);
+			offset_measured = true;
+			offset_usec = delta_usec;
 
-						
+			if (opt_dry_run) {
+				printf("Dry run : Time not set\n");
+			} else if (!opt_force_step && llabs(delta_usec) < MAX_SLEW_USEC) {
+				timeval_subtract(&delta_timev, &gps_timev, &sys_timev);
+				printf("Adjtime (slewing by %+.3f s) : ",
+				       (double)delta_usec / 1e6);
+				if (adjtime(&delta_timev, NULL) == 0) {
+					printf("Successfully updated local time.\n");
+					date_changed = true;
+					set_method = "slew";
+				} else {
+					fprintf(stderr, "Couldn't set local time. "
+						"Do you have root privileges?\n");
 				}
-				else
-				{
-					printf("settime : ");
-					if (settimeofday(&gps_timev, NULL) == 0) {
-						printf("Successfully updated local time.\n");
-						date_changed = true;
-					} else {
-						fprintf(stderr, "Couldn't set local time. "
-							"Do you have root privileges?\n");
-					}	
+			} else {
+				/* Apply the offset to the current time rather than
+				   setting gps_timev, which is already stale by the
+				   time spent since the sentence arrived: */
+				struct timeval now_timev, new_timev;
+				gettimeofday(&now_timev, NULL);
+				long long new_usec = (long long)now_timev.tv_sec * 1000000LL +
+						     now_timev.tv_usec + delta_usec;
+				new_timev.tv_sec = (time_t)(new_usec / 1000000LL);
+				new_timev.tv_usec = (suseconds_t)(new_usec % 1000000LL);
+
+				printf("settime (stepping by %+.3f s) : ",
+				       (double)delta_usec / 1e6);
+				if (settimeofday(&new_timev, NULL) == 0) {
+					printf("Successfully updated local time.\n");
+					date_changed = true;
+					set_method = "step";
+				} else {
+					fprintf(stderr, "Couldn't set local time. "
+						"Do you have root privileges?\n");
 				}
-			}
-			else	
-			{
-				 printf("Dry run : Time no set\n");
 			}
 
 			read_gps = false;
@@ -258,7 +280,7 @@ int main(int argc, char **argv)
 
 	/* Handle options: */
 	int c;
-	while ((c = getopt(argc, argv, "hrnb:d:t:")) != -1) {
+	while ((c = getopt(argc, argv, "hrnsb:d:t:")) != -1) {
 		switch (c) {
 		case 'b':
 			sscanf(optarg, "%d", &baudrate);
@@ -273,6 +295,9 @@ int main(int argc, char **argv)
                 case 'n':
                         opt_dry_run = true;
                         break;
+		case 's':
+			opt_force_step = true;
+			break;
 		case 'h':
 			print_help(true, argv[0]);
 			return 0;
@@ -295,6 +320,14 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Can't open port %s at %d baud\n",
 			port_name, baudrate);
 		return 1;
+	}
+
+	/* Stop any earlier adjtime() slew so it doesn't keep drifting the
+	   clock while we measure and after we step it: */
+	if (opt_force_step && !opt_dry_run) {
+		struct timeval zero = { 0, 0 };
+		if (adjtime(&zero, NULL) != 0)
+			perror("adjtime (cancel slew)");
 	}
 
 	signal(SIGINT, &signal_handler);
@@ -325,9 +358,25 @@ int main(int argc, char **argv)
 		if (ready <= 0)
 			continue;
 
+		/* Timestamp before read(), as close to arrival as we can get: */
+		struct timeval chunk_timev;
+		gettimeofday(&chunk_timev, NULL);
+
 		ssize_t nread = read(fd, buffer, sizeof(buffer));
 		if (nread > 0) {
-			nmea_parse(buffer, (size_t)nread, &process_message);
+			/* Feed the parser one '$'-delimited piece at a time so each
+			   sentence is stamped with the chunk its '$' arrived in,
+			   even when the sentence spans several reads: */
+			const char *p = buffer, *end = buffer + nread;
+			while (p < end && read_gps) {
+				const char *next = memchr(p + 1, '$', (size_t)(end - p - 1));
+				if (!next)
+					next = end;
+				if (*p == '$')
+					sentence_timev = chunk_timev;
+				nmea_parse(p, (size_t)(next - p), &process_message);
+				p = next;
+			}
 		} else if (nread == 0 || (errno != EAGAIN && errno != EINTR)) {
 			fprintf(stderr, "Lost connection to %s\n", port_name);
 			break;
@@ -335,6 +384,11 @@ int main(int argc, char **argv)
 	}
 
 	close(fd);
+
+	if (offset_measured)
+		printf("offset_us=%+lld method=%s\n", offset_usec, set_method);
+	else
+		printf("offset_us=unknown method=%s\n", set_method);
 
 	return date_changed ? 0 : 2;
 }
