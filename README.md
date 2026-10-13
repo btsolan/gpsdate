@@ -65,6 +65,8 @@ Options:
   -n               Dry run , Get the GPS time but don't apply it
   -s               Always step the clock with settimeofday(), never slew
                    (also cancels any adjtime() slew already in progress)
+  -l,--latency <ms> Added to the GPS time to compensate for RMC sentence
+                   delivery latency; may be 0 or negative (Default 30 ms)
 
 The last line printed is machine-readable:
   offset_us=<+/-usec GPS minus system time, or unknown> method=step|slew|none

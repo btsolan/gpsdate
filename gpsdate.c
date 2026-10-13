@@ -25,6 +25,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <errno.h>
 #include <poll.h>
 #include <sys/time.h>
@@ -35,6 +36,8 @@
 
 #define DEFAULT_BAUDRATE	9600
 #define DEFAULT_TIMEOUT		10
+/* RMC is sent after the second it describes; measured ~30-32 ms late: */
+#define DEFAULT_LATENCY_MS	30
 #define POLL_INTERVAL_MS	1000
 /* the correcti is 1024 weeks : 1024*7*24*3600 */
 #define ROLLOVER_CORRECTION	619315200
@@ -50,6 +53,7 @@ static bool date_changed;
 static bool opt_correct_rollover = false;
 static bool opt_dry_run = false;
 static bool opt_force_step = false;
+static long opt_latency_ms = DEFAULT_LATENCY_MS;
 
 /* System time when the '$' of the sentence being parsed arrived: */
 static struct timeval sentence_timev;
@@ -70,7 +74,9 @@ static const char *help_text =
 "  -r               Correct GPS week number rollover\n"
 "  -n               Dry run , Get the GPS time but don\'t apply it\n"
 "  -s               Always step the clock with settimeofday(), never slew\n"
-"                   (also cancels any adjtime() slew already in progress)\n\n"
+"                   (also cancels any adjtime() slew already in progress)\n"
+"  -l,--latency <ms> Added to the GPS time to compensate for RMC sentence\n"
+"                   delivery latency; may be 0 or negative (Default %d ms)\n\n"
 "The last line printed is machine-readable:\n"
 "  offset_us=<+/-usec GPS minus system time, or unknown> method=step|slew|none\n";
 
@@ -128,7 +134,8 @@ static void print_help(bool full_help, const char *program_name)
 {
 	if (full_help) {
 		printf("Usage: %s [options] port\n", program_name);
-		printf(help_text, DEFAULT_BAUDRATE, DEFAULT_TIMEOUT);
+		printf(help_text, DEFAULT_BAUDRATE, DEFAULT_TIMEOUT,
+		       DEFAULT_LATENCY_MS);
 	} else {
 		fprintf(stderr, "Usage: %s [-bt] port\n", program_name);
 		fprintf(stderr, "Run `%s -h` for help.\n", program_name);
@@ -209,7 +216,13 @@ static void process_message(const char *msgid, const char **data)
 			gps_timev.tv_sec = timegm(t);
 
 			gps_timev.tv_sec+=rollover_correction;
-			gps_timev.tv_usec = usec;
+
+			/* Compensate for the sentence arriving after the time
+			   it reports: */
+			long long gps_usec = (long long)gps_timev.tv_sec * 1000000LL +
+					     usec + opt_latency_ms * 1000LL;
+			gps_timev.tv_sec = (time_t)(gps_usec / 1000000LL);
+			gps_timev.tv_usec = (suseconds_t)(gps_usec % 1000000LL);
 
 			if ( opt_correct_rollover == true )  {
 
@@ -217,8 +230,9 @@ static void process_message(const char *msgid, const char **data)
 				printf("1024 weeks Corrected time is: " TIME_FMT " (%s)\n",
                         	       (new_t->tm_year + 1900), (new_t->tm_mon + 1), new_t->tm_mday,
 	                               new_t->tm_hour, new_t->tm_min, new_t->tm_sec,
-				       usec / 1000, new_t->tm_zone);
+				       (long)gps_timev.tv_usec / 1000, new_t->tm_zone);
 			}
+			printf("Latency compensation: %+ld ms\n", opt_latency_ms);
 			long long delta_usec =
 				(long long)(gps_timev.tv_sec - sys_timev.tv_sec) * 1000000LL +
 				(gps_timev.tv_usec - sys_timev.tv_usec);
@@ -279,8 +293,14 @@ int main(int argc, char **argv)
 	int baudrate = DEFAULT_BAUDRATE;
 
 	/* Handle options: */
+	static const struct option long_options[] = {
+		{ "latency", required_argument, NULL, 'l' },
+		{ NULL, 0, NULL, 0 }
+	};
+	char *endptr;
 	int c;
-	while ((c = getopt(argc, argv, "hrnsb:d:t:")) != -1) {
+	while ((c = getopt_long(argc, argv, "hrnsb:d:t:l:", long_options,
+				NULL)) != -1) {
 		switch (c) {
 		case 'b':
 			sscanf(optarg, "%d", &baudrate);
@@ -297,6 +317,16 @@ int main(int argc, char **argv)
                         break;
 		case 's':
 			opt_force_step = true;
+			break;
+		case 'l':
+			errno = 0;
+			opt_latency_ms = strtol(optarg, &endptr, 10);
+			if (errno != 0 || endptr == optarg || *endptr != '\0' ||
+			    opt_latency_ms < -1000 || opt_latency_ms > 1000) {
+				fprintf(stderr, "Invalid latency '%s' (expected "
+					"-1000..1000 ms)\n", optarg);
+				return 1;
+			}
 			break;
 		case 'h':
 			print_help(true, argv[0]);

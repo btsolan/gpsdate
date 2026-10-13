@@ -23,7 +23,7 @@ There is no test suite in this repo.
 ./gpsdate [options] port
 ```
 
-Setting the time requires root (`sudo ./gpsdate ...`). Notable options: `-b <baudrate>` (default 9600), `-t`/`-d <timeout seconds>` (0 = no timeout, default 10), `-r` (apply the 1024-week GPS rollover correction), `-n` (dry run — parse and print GPS time but don't set it). Exit code is `0` if the date was changed, `2` if not, `1` on usage/port errors.
+Setting the time requires root (`sudo ./gpsdate ...`). Notable options: `-b <baudrate>` (default 9600), `-t`/`-d <timeout seconds>` (0 = no timeout, default 10), `-r` (apply the 1024-week GPS rollover correction), `-n` (dry run — parse and print GPS time but don't set it), `-s` (always step, never slew), `-l`/`--latency <ms>` (added to the RMC time to compensate for the sentence arriving after the second it reports; default `DEFAULT_LATENCY_MS` = 30, measured ~30–32 ms against NTP). Exit code is `0` if the date was changed, `2` if not, `1` on usage/port errors.
 
 ## Architecture
 
